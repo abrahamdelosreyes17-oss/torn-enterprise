@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Enterprise
 // @namespace    torn-enterprise
-// @version      0.1.0
+// @version      0.1.1
 // @description  Run your Torn company and recruit for it: staff, stock, stars and candidates, on a page of its own.
 // @author       -
 // @match        https://www.torn.com/companies.php*
@@ -39,7 +39,7 @@
 (function () {
     'use strict';
 
-    const TENT_BUILD_VERSION = '0.1.0';
+    const TENT_BUILD_VERSION = '0.1.1';
     const TENT_SERVER_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -221,6 +221,15 @@
         });
     }
 
+    /** The script's version from the userscript host, or 'dev' (preview, tests). */
+    function gmVersion() {
+        try {
+            return typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version ? String(GM_info.script.version) : 'dev';
+        } catch {
+            return 'dev';
+        }
+    }
+
     /* ===== src/api/client.js ===== */
     /*
      * The one place that talks to the network (adapted from Torn Archive's client, simplified).
@@ -354,6 +363,9 @@
          * @param {function({role: string, index: number, code: number})} [options.onKeyDead]
          * @param {function({path: string, tag: string|null})} [options.onSent] - each request that leaves (usage record)
          * @param {function({path: string, tag: string|null, error: Error})} [options.onFailed] - a call that failed for good
+         * @param {function({path: string, params: object, tag: string|null, role: string, index: number|null, ms: number,
+         *   data?: *, error?: Error})} [options.onAnswer] - each answer or failure of a request that left (diagnostic log);
+         *   `params` is the query without the key, which only the URL carries
          */
         constructor({
             getKeys,
@@ -367,6 +379,7 @@
             onKeyDead = null,
             onSent = null,
             onFailed = null,
+            onAnswer = null,
         } = {}) {
             this.getKeys = getKeys || (() => ({ director: '', public: [] }));
             this.fetchImpl = fetchImpl;
@@ -379,6 +392,7 @@
             this.onKeyDead = onKeyDead;
             this.onSent = onSent;
             this.onFailed = onFailed;
+            this.onAnswer = onAnswer;
 
             /** Key text -> the Torn code that killed it. Held in memory only. */
             this.dead = new Map();
@@ -597,9 +611,13 @@
                     }
                 }
 
+                const startedAt = this.now();
                 try {
-                    return await this.requestOnce(job, pick);
+                    const data = await this.requestOnce(job, pick);
+                    this.tellAnswer(job, pick, startedAt, { data });
+                    return data;
                 } catch (error) {
+                    this.tellAnswer(job, pick, startedAt, { error });
                     if (!(error instanceof TornApiError)) throw error;
                     error.keyRole = pick.role;
                     error.keyIndex = pick.index;
@@ -634,6 +652,15 @@
                     await this.sleep(Math.max(0, this.pause.until - this.now()) + 25);
                     attempt += 1;
                 }
+            }
+        }
+
+        tellAnswer(job, pick, startedAt, result) {
+            if (!this.onAnswer) return;
+            try {
+                this.onAnswer({ path: job.path, params: job.params || {}, tag: job.tag, role: pick.role, index: pick.index ?? null, ms: this.now() - startedAt, ...result });
+            } catch {
+                // The log is best-effort.
             }
         }
 
@@ -2590,15 +2617,17 @@
         return recNum(position && position.primaryReq) + recNum(position && position.secondaryReq);
     }
 
-    const recLastAction = [[5, 'lastActionNow'], [20, 'lastActionRecent'], [60, 'lastActionHourAgo'], [1440, 'lastActionDayAgo'],
-        [10080, 'lastActionWeekAgo'], [43200, 'lastActionMonthAgo']];
     const recLastNames = { now: 'lastActionNow', recent: 'lastActionRecent', hour: 'lastActionHourAgo', day: 'lastActionDayAgo',
         week: 'lastActionWeekAgo', month: 'lastActionMonthAgo', year: 'lastActionYearAgo' };
 
     /**
      * The `filters` string for Torn's /user/search (comma separated; level uses `level:>=:N`).
      * @param f {inCompany: true|false|null, kinds?:{none, city, company}, lastAction: 'now'|'recent'|'hour'|'day'|'week'|
-     *   'month'|'year', lastWithinMin: minutes (rounded up to the next bucket), levelMin, levelMax}
+     *   'month'|'year', lastWithinMin: minutes, levelMin, levelMax}
+     *   Torn's last-action buckets past "now" read as "last seen at least that long ago" (tools that hunt inactive players
+     *   ask for lastActionYearAgo), so "day ago" for "within 24 hours" returned only people away a day or more and the
+     *   check after the lookups left out every one. Any "within" window asks for players on now; the exact window is
+     *   checked after the lookups.
      *   Without `inCompany`, it is read from `kinds`: no company jobs wanted = notInCompany, only company jobs = inCompany.
      *   A city job is not "in a company", so recFilter does the exact job-kind filtering afterwards.
      */
@@ -2612,10 +2641,7 @@
         if (inCo === true) out.push('inCompany');
         else if (inCo === false) out.push('notInCompany');
         if (f.lastAction && recLastNames[f.lastAction]) out.push(recLastNames[f.lastAction]);
-        else if (recNum(f.lastWithinMin) > 0) {
-            const hit = recLastAction.find(([m]) => f.lastWithinMin <= m);
-            out.push(hit ? hit[1] : 'lastActionYearAgo');
-        }
+        else if (recNum(f.lastWithinMin) > 0) out.push('lastActionNow');
         if (recNum(f.levelMin) > 1) out.push(`level:>=:${Math.floor(f.levelMin)}`);
         if (recNum(f.levelMax) > 0 && f.levelMax < 100) out.push(`level:<=:${Math.floor(f.levelMax)}`);
         return out.join(',');
@@ -2638,8 +2664,9 @@
     }
 
     /**
-     * Filter the players Torn returned.
-     * @param players Player[]
+     * The first filter a player fails, or null when they pass: 'ours' (our own company), 'job', 'work', 'level', 'stars',
+     * 'days', 'director', 'last', 'marked'.
+     * @param p Player
      * @param f {workMin, workMax (0 or missing = open), levelMin, levelMax, kinds:{none, city, company} (default all),
      *   starsMax (company jobs only), dirMin (director away at least this many days), daysMin (days in the job),
      *   lastWithinMin (minutes), hideContactedDays (0 = never hide)}
@@ -2647,37 +2674,50 @@
      * @param ctx {nowSec, companyId} our own company's people are left out
      *   A player with an unknown work-stats total fails a work-stats range; an unknown director-away or last action fails its filter.
      */
-    function recFilter(players, f = {}, marks = null, ctx = {}) {
+    function recOut(p, f = {}, marks = null, ctx = {}) {
         const kinds = { none: true, city: true, company: true, ...(f.kinds || {}) };
         const now = ctx.nowSec;
-        return (players || []).filter((p) => {
-            const j = p.job || { kind: 'none' };
-            if (ctx.companyId != null && j.kind === 'company' && String(j.companyId) === String(ctx.companyId)) return false;
-            if (!kinds[j.kind]) return false;
-            const ws = p.workStats;
-            if (recNum(f.workMin) > 0 && !(ws != null && ws >= f.workMin)) return false;
-            if (recNum(f.workMax) > 0 && !(ws != null && ws <= f.workMax)) return false;
-            if (recNum(f.levelMin) > 0 && !(p.level >= f.levelMin)) return false;
-            if (recNum(f.levelMax) > 0 && !(p.level <= f.levelMax)) return false;
-            if (j.kind === 'company') {
-                if (f.starsMax != null && recNum(j.stars) > f.starsMax) return false;
-                if (recNum(f.daysMin) > 0 && !(recNum(j.days) >= f.daysMin)) return false;
-                if (recNum(f.dirMin) > 0) {
-                    const away = recDirectorAway(p, now);
-                    if (away == null || away < f.dirMin) return false;
-                }
+        const j = p.job || { kind: 'none' };
+        if (ctx.companyId != null && j.kind === 'company' && String(j.companyId) === String(ctx.companyId)) return 'ours';
+        if (!kinds[j.kind]) return 'job';
+        const ws = p.workStats;
+        if (recNum(f.workMin) > 0 && !(ws != null && ws >= f.workMin)) return 'work';
+        if (recNum(f.workMax) > 0 && !(ws != null && ws <= f.workMax)) return 'work';
+        if (recNum(f.levelMin) > 0 && !(p.level >= f.levelMin)) return 'level';
+        if (recNum(f.levelMax) > 0 && !(p.level <= f.levelMax)) return 'level';
+        if (j.kind === 'company') {
+            if (f.starsMax != null && recNum(j.stars) > f.starsMax) return 'stars';
+            if (recNum(f.daysMin) > 0 && !(recNum(j.days) >= f.daysMin)) return 'days';
+            if (recNum(f.dirMin) > 0) {
+                const away = recDirectorAway(p, now);
+                if (away == null || away < f.dirMin) return 'director';
             }
-            if (recNum(f.lastWithinMin) > 0) {
-                const ts = p.lastAction && p.lastAction.timestamp;
-                if (ts == null || !Number.isFinite(now) || (now - ts) / 60 > f.lastWithinMin) return false;
-            }
-            if (recNum(f.hideContactedDays) > 0) {
-                const m = recMark(marks, p.id);
-                if (m && (m.status === 'Contacted' || m.status === 'Rejected')
-                    && (!Number.isFinite(now) || m.at == null || now - m.at < f.hideContactedDays * 86400)) return false;
-            }
-            return true;
-        });
+        }
+        if (recNum(f.lastWithinMin) > 0) {
+            const ts = p.lastAction && p.lastAction.timestamp;
+            if (ts == null || !Number.isFinite(now) || (now - ts) / 60 > f.lastWithinMin) return 'last';
+        }
+        if (recNum(f.hideContactedDays) > 0) {
+            const m = recMark(marks, p.id);
+            if (m && (m.status === 'Contacted' || m.status === 'Rejected')
+                && (!Number.isFinite(now) || m.at == null || now - m.at < f.hideContactedDays * 86400)) return 'marked';
+        }
+        return null;
+    }
+
+    /** The players that pass every filter (see recOut). */
+    function recFilter(players, f = {}, marks = null, ctx = {}) {
+        return (players || []).filter((p) => recOut(p, f, marks, ctx) == null);
+    }
+
+    /** How many players each filter left out: { work: 312, last: 150, ... }, the biggest first. */
+    function recOutCounts(players, f = {}, marks = null, ctx = {}) {
+        const n = {};
+        for (const p of players || []) {
+            const why = recOut(p, f, marks, ctx);
+            if (why) n[why] = (n[why] || 0) + 1;
+        }
+        return Object.fromEntries(Object.entries(n).sort((a, b) => b[1] - a[1]));
     }
 
     /**
@@ -3658,9 +3698,9 @@
     .app.collapsed .side{width:60px}
     .side-in{position:absolute;inset:0 auto 0 0;width:var(--sw);background:var(--side);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:12px 10px 10px;overflow:hidden;transition:width .26s var(--ease),box-shadow .26s}
     .app.collapsed .side-in{width:60px}
-    .app.collapsed .side:hover .side-in,.app.collapsed .side:focus-within .side-in{width:var(--sw);box-shadow:var(--shadow-2)}
+    .app.collapsed:not(.hold) .side:hover .side-in,.app.collapsed:not(.hold) .side:focus-within .side-in{width:var(--sw);box-shadow:var(--shadow-2)}
     .lbl{white-space:nowrap;transition:opacity .18s}
-    .app.collapsed .side:not(:hover):not(:focus-within) .lbl{opacity:0;pointer-events:none}
+    .app.collapsed .side:not(:hover):not(:focus-within) .lbl,.app.collapsed.hold .side .lbl{opacity:0;pointer-events:none}
     .brand{display:flex;align-items:center;gap:10px;padding:2px 4px 12px;min-height:44px}
     .logo{width:30px;height:30px;border-radius:8px;background:var(--text);color:var(--bg);display:grid;place-items:center;font-weight:600;font-size:13px;flex:none}
     .brand b{font-size:14px;font-weight:600;line-height:1.2}
@@ -3678,10 +3718,10 @@
     .nav .ct{margin-left:auto;font-size:11.5px;color:var(--text-3);font-family:var(--mono)}
     .nav button[aria-current="true"] .ct{color:var(--accent)}
     .nav .ct.hot{color:var(--bad);font-weight:600}
-    .app.collapsed .side:not(:hover):not(:focus-within) .nav .ct.hot{position:absolute;left:30px;top:2px;margin:0;opacity:1;font-size:10px}
+    .app.collapsed .side:not(:hover):not(:focus-within) .nav .ct.hot,.app.collapsed.hold .side .nav .ct.hot{position:absolute;left:30px;top:2px;margin:0;opacity:1;font-size:10px}
     .cap{position:relative;padding:12px 10px 4px;font-size:10.5px;font-weight:600;line-height:14px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);flex:none}
     .cap::after{content:"";position:absolute;left:10px;top:19px;width:20px;border-top:1px solid var(--border);opacity:0;transition:opacity .18s}
-    .app.collapsed .side:not(:hover):not(:focus-within) .cap::after{opacity:1}
+    .app.collapsed .side:not(:hover):not(:focus-within) .cap::after,.app.collapsed.hold .side .cap::after{opacity:1}
     .sfoot{margin-top:6px;padding-top:10px;border-top:1px solid var(--border);display:grid;gap:8px;flex:none}
     .me{display:flex;align-items:center;gap:9px;padding:0 4px;min-width:0}
     .av{width:28px;height:28px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;font-size:11px;font-weight:600;flex:none}
@@ -3689,7 +3729,7 @@
     .who2 b{display:block;font-size:12.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis}
     .who2 span{display:block;font-size:11px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis}
     .fbtns{display:flex;gap:2px;padding:0 2px}
-    .app.collapsed .side:not(:hover):not(:focus-within) .fbtns{flex-direction:column;align-items:center}
+    .app.collapsed .side:not(:hover):not(:focus-within) .fbtns,.app.collapsed.hold .side .fbtns{flex-direction:column;align-items:center}
     .ib{position:relative;width:30px;height:30px;border-radius:7px;display:grid;place-items:center;color:var(--text-3);transition:background .15s,color .15s}
     .ib:hover{background:var(--hover);color:var(--text)}
     .ib[aria-current="true"]{background:var(--accent-soft);color:var(--accent)}
@@ -4321,6 +4361,141 @@
      </div><div class="sticky">${sel ? pgPanel(h, sel) : ''}</div></div>`;
     }
 
+    /* ===== src/app/log.js ===== */
+    // The diagnostic log: the last Torn calls and searches, for Settings > Export logs. Each Torn call is one entry with
+    // its path, its query (the client adds the key only to the URL it sends, so the query here never holds one), how long
+    // it took, and a summary of the answer (counts and a few fields, never the whole answer) or Torn's error, redacted.
+    // Searches add their own entries: the filters sent to Torn, each page's rows, and why players were left out.
+    //
+    // st.log is a list of entries, oldest first, at most LOG_KEEP; kept under the gm key `log`, written at most every
+    // 10 seconds.
+
+
+
+    const LOG_KEEP = 400;
+    const LOG_SAVE_MS = 10 * 1000;
+
+    /** Read what was kept. */
+    function logLoad(st) {
+        const rows = gmGet('log', []);
+        st.log = Array.isArray(rows) ? rows.slice(-LOG_KEEP) : [];
+        return st;
+    }
+
+    /** Write it now. */
+    function logSave(st) {
+        st.logSavedAt = Date.now();
+        gmSet('log', st.log || []);
+    }
+
+    /** Forget it (Clear all). */
+    function logClear(st) {
+        st.log = [];
+        if (st.logTimer) clearTimeout(st.logTimer);
+        st.logTimer = null;
+        gmDel('log');
+    }
+
+    function logSchedule(st) {
+        const wait = (st.logSavedAt || 0) + LOG_SAVE_MS - Date.now();
+        if (wait <= 0) {
+            logSave(st);
+            return;
+        }
+        if (st.logTimer) return;
+        st.logTimer = setTimeout(() => {
+            st.logTimer = null;
+            logSave(st);
+        }, wait);
+    }
+
+    /** Add one entry ({kind, ...}); the time is added here. */
+    function logAdd(st, entry) {
+        if (!st) return;
+        if (!Array.isArray(st.log)) st.log = [];
+        st.log.push({ at: new Date().toISOString(), ...entry });
+        if (st.log.length > LOG_KEEP + 50) st.log = st.log.slice(-LOG_KEEP);
+        try {
+            logSchedule(st);
+        } catch {
+            // The log is best-effort.
+        }
+    }
+
+    const logCount = (list, field) => {
+        const n = {};
+        for (const x of list) {
+            const v = String(x && x[field]);
+            n[v] = (n[v] || 0) + 1;
+        }
+        return n;
+    };
+
+    /** A short picture of a Torn answer: what a reader needs to see why a search or a page came out empty. */
+    function logSummary(path, data) {
+        if (typeof data === 'string') return { text: data.length };
+        if (!data || typeof data !== 'object') return { value: data === undefined ? 'undefined' : data };
+        const out = {};
+        if (Array.isArray(data.search)) {
+            out.rows = data.search.length;
+            out.online = logCount(data.search, 'online');
+            out.levels = data.search.length ? [Math.min(...data.search.map((r) => Number(r.level) || 0)), Math.max(...data.search.map((r) => Number(r.level) || 0))] : [];
+            out.first = data.search.slice(0, 3).map((r) => ({ id: r.id, level: r.level, online: r.online }));
+        }
+        if (data._metadata) {
+            out.total = data._metadata.total ?? null;
+            out.next = !!(data._metadata.links && data._metadata.links.next);
+        }
+        if (data.profile && typeof data.profile === 'object') {
+            const la = data.profile.last_action || {};
+            out.profile = { id: data.profile.id, level: data.profile.level, last: la.status, lastAgoMin: la.timestamp ? Math.round((Date.now() / 1000 - la.timestamp) / 60) : null };
+        }
+        if ('job' in data) out.job = data.job ? { type: data.job.type, rating: data.job.rating ?? null, days: data.job.days_in_company ?? null } : null;
+        if (data.hof && typeof data.hof === 'object') out.workStats = data.hof.working_stats ? data.hof.working_stats.value ?? null : 'missing';
+        const rest = Object.keys(data).filter((k) => !['search', '_metadata', 'profile', 'job', 'hof'].includes(k));
+        if (rest.length) out.keys = rest.map((k) => (Array.isArray(data[k]) ? `${k}[${data[k].length}]` : k));
+        return out;
+    }
+
+    /** Record every answer and failure the client sees. Chains to any onAnswer the client already has. */
+    function logAttach(st, client) {
+        const before = client.onAnswer;
+        client.onAnswer = (info) => {
+            try {
+                const e = { kind: 'call', path: info.path, query: info.params || {}, tag: info.tag, key: info.role + (info.index != null ? ' ' + info.index : ''), ms: info.ms };
+                if (info.error) {
+                    e.error = client.redact ? client.redact(String(info.error.message || info.error)) : String(info.error.message || info.error);
+                    if (info.error.code != null) e.code = info.error.code;
+                } else {
+                    e.answer = logSummary(info.path, info.data);
+                }
+                logAdd(st, e);
+            } catch {
+                // The log is best-effort.
+            }
+            if (before) before(info);
+        };
+        return client;
+    }
+
+    /** What Export logs downloads: the app, the settings, how many keys (never a key), the data held, and the log. */
+    function logExport(st, { version = 'dev', nowSec = Math.floor(Date.now() / 1000) } = {}) {
+        const keys = st.keys || {};
+        return {
+            app: 'Torn Enterprise',
+            version,
+            exportedAt: new Date(nowSec * 1000).toISOString(),
+            settings: st.settings || {},
+            keys: { director: !!keys.director, public: Array.isArray(keys.public) ? keys.public.filter(Boolean).length : 0 },
+            held: {
+                company: st.company ? { id: st.company.id, stars: st.company.stars, type: st.company.typeId ?? null } : null,
+                players: Object.keys(st.players || {}).length,
+                types: Object.keys(st.ctypes || {}),
+            },
+            log: st.log || [],
+        };
+    }
+
     /* ===== src/app/search.js ===== */
     // Recruit's search on Torn: pages of players, then one lookup each (work stats, job), filtered and sorted by the engine
     // as the answers come in. Torn's search can only filter on level, company/no company and last action, so the work-stats
@@ -4329,6 +4504,7 @@
     //
     // The caller passes `getF()` so the filters the director changes while it runs apply to the next player; the search
     // itself is not restarted.
+
 
 
 
@@ -4368,10 +4544,10 @@
      * @param {{st: object, client: object, api?: object, getF: function(): object, best: number, nowSec: function(): number,
      *   onProgress?: function(object)}} o
      * @returns {{prog: object, stop: function(), done: Promise}} prog: {state: 'running'|'done'|'stopped'|'error', total,
-     *   checked, calls, ids: [playerId], error}
+     *   checked, calls, ids: [playerId], error, failed: lookups Torn did not answer, failText: the last such answer}
      */
     function appSearchStart({ st, client, api = APP_SEARCH_API, getF, best, nowSec, onProgress = () => {} }) {
-        const prog = { state: 'running', total: 0, checked: 0, calls: 0, ids: [], error: '' };
+        const prog = { state: 'running', total: 0, checked: 0, calls: 0, ids: [], error: '', failed: 0, failText: '' };
         let stopped = false;
         const asking = new Set();
         const settings = st.settings;
@@ -4381,6 +4557,19 @@
         const finish = (state, error = '') => {
             prog.state = state;
             prog.error = error;
+            try {
+                const found = prog.ids.map((id) => st.players[String(id)]).filter(Boolean);
+                const f = getF();
+                logAdd(st, {
+                    kind: 'search-end', state, error, total: prog.total, checked: prog.checked, calls: prog.calls,
+                    found: found.length, failed: prog.failed, failText: prog.failText,
+                    matched: recFilter(found, f, st.marks, { nowSec: nowSec(), companyId: ourId() }).length,
+                    leftOut: recOutCounts(found, f, st.marks, { nowSec: nowSec(), companyId: ourId() }),
+                });
+                logSave(st); // the end of a search is the entry most wanted in an export: written at once
+            } catch {
+                // The log is best-effort.
+            }
             appSavePlayers(st);
             appSave(st, 'cobrief');
             onProgress(prog);
@@ -4422,6 +4611,7 @@
         }
 
         async function run() {
+            logAdd(st, { kind: 'search-start', best, torn: appServerFilters(getF()), filters: getF() });
             const rows = [];
             const seen = new Set();
             let cursor = null;
@@ -4454,6 +4644,9 @@
                         appRememberPlayer(st, p);
                     } catch (error) {
                         if (apiIsStopper(error)) throw error;
+                        prog.failed += 1;
+                        const text = String((error && error.message) || error);
+                        prog.failText = client.redact ? client.redact(text) : text;
                         p = null;
                     }
                 }
@@ -4570,6 +4763,19 @@
         return { all: sorted.length, rows: sorted.slice(0, ui.f.best), match, pool: pgPool(h).length, v };
     }
 
+    const PG_OUT = { ours: 'Our staff', job: 'Job now', work: 'Work stats', level: 'Level', stars: 'Stars', days: 'Days there',
+        director: 'Director away', last: 'Last action', marked: 'Contacted or rejected' };
+
+    /** Why a finished search shows no one: each filter and how many it left out, or what Torn answered. */
+    function pgNoneWhy(h) {
+        const s = h.ui.search;
+        const pool = pgPool(h);
+        if (!pool.length && s && s.prog.failed) return 'Torn did not answer · ' + uiEsc(s.prog.failText);
+        if (!pool.length) return s && s.prog.state === 'done' && s.prog.checked === 0 ? 'Torn found no players for these filters' : '';
+        const out = recOutCounts(pool, pgFilter(h), h.st.marks, { nowSec: h.now, companyId: pgOurCompanyId(h) });
+        return 'Left out · ' + Object.entries(out).map(([k, n]) => `${PG_OUT[k] || k} ${uiFmt(n)}`).join(' · ');
+    }
+
     const pgJobText = (h, p) => {
         const j = p.job;
         if (!j) return '<span class="muted">—</span>';
@@ -4609,6 +4815,7 @@
         const cols = 6 + (hasRatio || showFits ? 1 : 0);
         const tail = s
             ? (s.prog.state === 'running' ? `${s.prog.checked} of ${s.prog.total || '…'} checked` : s.prog.state === 'error' ? 'stopped: ' + uiEsc(s.prog.error) : `${s.prog.checked} checked`)
+                + (s.prog.failed ? ` · ${uiFmt(s.prog.failed)} unread` : '')
             : `of ${uiFmt(r.pool)} remembered`;
 
         const body = r.rows.map((p) => {
@@ -4625,7 +4832,7 @@
        ${open ? `<tr class="det"><td colspan="${cols}">${pgDetail(h, p, match)}</td></tr>` : ''}`;
         }).join('');
 
-        const empty = s ? (running ? 'Checking players…' : 'No one matches · widen the work stats range or job filters') : 'Search Torn to find players';
+        const empty = s ? (running ? 'Checking players…' : 'No one matches' + ((why) => (why ? `<div class="muted">${why}</div>` : ''))(pgNoneWhy(h))) : 'Search Torn to find players';
         const head = hasRatio ? '<th>vs need</th>' : showFits ? `<th>${uiEsc(match.type ? match.type.name : '')} seats</th>` : '';
         return `<div class="rhead"><span class="cnt num">${uiFmt(r.all)}</span><span class="muted">match · ${tail}</span>
       <div class="act"><span class="muted">Sort</span><select data-in="fsort" style="width:auto" aria-label="Sort">${[['close', match.need ? 'Closest to the need' : 'Lowest first'], ['move', 'Most likely to move'], ['act', 'Most active'], ['high', 'Highest stats']].map(([val, l]) => `<option value="${val}" ${ui.f.sort === val ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
@@ -5141,7 +5348,7 @@
         ['hideContactedDays', 'Hide contacted for', 'recruiting'], ['recheckDays', 'Recheck a player after', 'recruiting'], ['message', 'Message', 'recruiting'],
         ['coverDays', 'Stock cover', 'stock'], ['stockMode', 'Order', 'stock'], ['thinProfitPct', 'Thin profit under', 'stock'],
         ['theme', 'Theme', 'display', 'dark light'], ['pinned', 'Sidebar pinned', 'display'], ['planMode', 'Staff plan', 'display'], ['compareTypeId', 'Compare type', 'display'],
-        ['counts', 'Data on this PC', 'data'], ['export', 'Export CSV', 'data', 'download log'], ['clear', 'Clear all', 'data', 'forget delete'],
+        ['counts', 'Data on this PC', 'data'], ['export', 'Export CSV', 'data', 'download log'], ['logs', 'Export logs', 'data', 'download diagnose debug'], ['clear', 'Clear all', 'data', 'forget delete'],
     ];
 
     const PG_TERMS = [
@@ -5370,6 +5577,7 @@
             row('snaps', 'Company snapshots', `<span class="num">${counts.snapshots} days</span>`),
             row('calls', 'Calls logged', `<span class="num">${uiFmt(calls)} in 24 h</span>`),
             row('export', 'Export', '<button class="btn sm" data-act="export">Export CSV</button>'),
+            row('logs', 'Logs', `<span class="muted num">${uiFmt((st.log || []).length)} entries</span><button class="btn sm" data-act="exportlogs">Export logs</button>`),
             row('clear', 'Forget saved data', clear),
         )}`;
     }
@@ -5410,6 +5618,7 @@
     // What a press does. Every control in the pages carries `data-act` (a button or row), or `data-f` / `data-in` / `data-set`
     // (a filter, a screen choice, a setting). hub.js listens once and calls these. Nothing here reads Torn by itself: it
     // changes the state or the screen's memory, then asks the hub to draw.
+
 
 
 
@@ -5597,16 +5806,27 @@
         hub.request();
     }
 
-    function hubExportCsv(hub) {
+    function hubDownload(hub, text, type, name) {
         const doc = hub.doc;
-        const url = URL.createObjectURL(new Blob([histCsv(hub.st.hist)], { type: 'text/csv' }));
+        const url = URL.createObjectURL(new Blob([text], { type }));
         const a = doc.createElement('a');
         a.href = url;
-        a.download = 'torn-enterprise-log.csv';
+        a.download = name;
         doc.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    function hubExportCsv(hub) {
+        hubDownload(hub, histCsv(hub.st.hist), 'text/csv', 'torn-enterprise-log.csv');
+    }
+
+    /** Settings > Export logs: the last calls and searches as JSON, for working out what went wrong. Never a key. */
+    function hubExportLogs(hub) {
+        const now = hub.nowSec();
+        const day = new Date(now * 1000).toISOString().slice(0, 10);
+        hubDownload(hub, JSON.stringify(logExport(hub.st, { version: gmVersion(), nowSec: now }), null, 1), 'application/json', `torn-enterprise-logs-${day}.json`);
     }
 
     // ---- the listeners' entry points ---------------------------------------------------------------------------------
@@ -5728,6 +5948,8 @@
                 return hubProbe(hub);
             case 'export':
                 return hubExportCsv(hub);
+            case 'exportlogs':
+                return hubExportLogs(hub);
             case 'clearask':
                 ui.confirmClear = true;
                 return hub.draw();
@@ -5741,6 +5963,7 @@
                 ui.diag = null;
                 appClearAll(st);
                 usageClear(st);
+                logClear(st);
                 hub.draw();
                 return sched.tick();
             default:
@@ -6206,6 +6429,11 @@
         hub.applyPinned = () => {
             const on = st.settings.pinned;
             hub.els.app.classList.toggle('collapsed', !on);
+            // Hover or focus opens the rail. Right after the pin is pressed the focus is on it and the pointer over it, so the
+            // focus leaves the sidebar and the rail is held shut until the pointer leaves.
+            const side = hub.els.app.querySelector('.side');
+            if (!on && side.contains(doc.activeElement)) doc.activeElement.blur();
+            hub.els.app.classList.toggle('hold', !on && side.matches(':hover'));
             const pin = el('pin');
             pin.setAttribute('aria-pressed', String(on));
             pin.title = on ? 'Unpin sidebar' : 'Pin sidebar';
@@ -6472,6 +6700,10 @@
             beat += 1;
             if (beat % 12 === 0) hub.request();
         }, 5000);
+
+        const side = hub.els.app.querySelector('.side');
+        side.addEventListener('mouseleave', () => hub.els.app.classList.remove('hold'));
+        side.addEventListener('focusin', (ev) => { if (ev.target.id !== 'pin') hub.els.app.classList.remove('hold'); });
 
         hub.applyTheme();
         hub.applyPinned();
@@ -7839,6 +8071,7 @@
 
 
 
+
     const MAIN_HUB_URL = 'https://abrahamdelosreyes17-oss.github.io/torn-enterprise/';
     const MAIN_HUB_RE = /^https:\/\/abrahamdelosreyes17-oss\.github\.io\/torn-enterprise\//;
 
@@ -7890,6 +8123,7 @@
         const st = appNewState();
         appLoad(st);
         usageLoad(st);
+        logLoad(st);
         const client = new TornApiClient({
             getKeys: () => st.keys,
             maxPerMinute: st.settings.callsPerMinute,
@@ -7897,6 +8131,7 @@
             onKeyDead: () => appTouch(st),
         });
         usageAttach(st, client); // chains to any onSent / onFailed the client already has
+        logAttach(st, client); // Settings > Export logs: each call's answer in brief, never a key
         srvStart({ st, client }); // the shared server: counts each request, sets the client's ceiling; st.server stays null with no address built in
         let leader = false;
         let lastInput = Date.now();
