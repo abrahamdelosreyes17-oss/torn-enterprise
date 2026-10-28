@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Enterprise
 // @namespace    torn-enterprise
-// @version      0.1.1
+// @version      0.1.2
 // @description  Run your Torn company and recruit for it: staff, stock, stars and candidates, on a page of its own.
 // @author       -
 // @match        https://www.torn.com/companies.php*
@@ -39,7 +39,7 @@
 (function () {
     'use strict';
 
-    const TENT_BUILD_VERSION = '0.1.1';
+    const TENT_BUILD_VERSION = '0.1.2';
     const TENT_SERVER_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -1435,7 +1435,7 @@
             id: normNum(r.id),
             name: String(r.name ?? ''),
             level: normNum(r.level),
-            online: API_ONLINE.has(r.online) ? r.online : 'Offline',
+            online: API_ONLINE.has(r.online) ? r.online : null, // null: Torn did not say (never read as Offline)
             factionId: r.faction_id ? normNum(r.faction_id) : null,
             lastAction: null,
             workStats: null,
@@ -2624,10 +2624,7 @@
      * The `filters` string for Torn's /user/search (comma separated; level uses `level:>=:N`).
      * @param f {inCompany: true|false|null, kinds?:{none, city, company}, lastAction: 'now'|'recent'|'hour'|'day'|'week'|
      *   'month'|'year', lastWithinMin: minutes, levelMin, levelMax}
-     *   Torn's last-action buckets past "now" read as "last seen at least that long ago" (tools that hunt inactive players
-     *   ask for lastActionYearAgo), so "day ago" for "within 24 hours" returned only people away a day or more and the
-     *   check after the lookups left out every one. Any "within" window asks for players on now; the exact window is
-     *   checked after the lookups.
+     *   Last action is left to recSearchPasses (`lastAction` names one bucket for a caller that wants exactly that).
      *   Without `inCompany`, it is read from `kinds`: no company jobs wanted = notInCompany, only company jobs = inCompany.
      *   A city job is not "in a company", so recFilter does the exact job-kind filtering afterwards.
      */
@@ -2641,10 +2638,50 @@
         if (inCo === true) out.push('inCompany');
         else if (inCo === false) out.push('notInCompany');
         if (f.lastAction && recLastNames[f.lastAction]) out.push(recLastNames[f.lastAction]);
-        else if (recNum(f.lastWithinMin) > 0) out.push('lastActionNow');
         if (recNum(f.levelMin) > 1) out.push(`level:>=:${Math.floor(f.levelMin)}`);
         if (recNum(f.levelMax) > 0 && f.levelMax < 100) out.push(`level:<=:${Math.floor(f.levelMax)}`);
         return out.join(',');
+    }
+
+    /**
+     * The Torn searches to run, in order, for the screen's filters: one `filters` string each.
+     * Online only asks for players on now. A "within" window asks for players on now first (they sort to the top), then
+     * the recent buckets that can hold someone seen inside it: Torn's buckets past "now" may mean "at least that long
+     * ago", so the window itself is checked after the lookups (recOut) and the search stops a pass that finds no one in it.
+     */
+    function recSearchPasses(f = {}) {
+        const base = recSearchFilters({ ...f, lastAction: null, lastWithinMin: 0 });
+        const join = (b) => [base, recLastNames[b]].filter(Boolean).join(',');
+        if (f.onlineOnly) return [join('now')];
+        const m = recNum(f.lastWithinMin);
+        if (!(m > 0)) return [base];
+        const buckets = m <= 60 ? ['now', 'recent'] : m <= 1440 ? ['now', 'recent', 'hour'] : ['now', 'recent', 'hour', 'day'];
+        return buckets.map(join);
+    }
+
+    const REC_ON_SEC = 15 * 60;
+
+    /** Online or Idle when Torn last told us (search row or lookup), within 15 minutes. */
+    function recOnlineNow(p, nowSec) {
+        if (!p || (p.online !== 'Online' && p.online !== 'Idle')) return false;
+        const at = p.onlineAt != null ? p.onlineAt : p.checkedAt;
+        return at != null && Number.isFinite(nowSec) && nowSec - at <= REC_ON_SEC;
+    }
+
+    /** The latest we know a player acted: their last action, or when Torn showed them Online. */
+    function recSeenAt(p) {
+        const ts = p.lastAction && p.lastAction.timestamp != null ? p.lastAction.timestamp : null;
+        const on = p.online === 'Online' ? (p.onlineAt != null ? p.onlineAt : p.checkedAt) : null;
+        if (ts == null) return on;
+        return on == null ? ts : Math.max(ts, on);
+    }
+
+    /** True when a window is set and the player was not seen inside it. */
+    function recLastOut(p, f, nowSec) {
+        if (f.onlineOnly) return !recOnlineNow(p, nowSec);
+        if (!(recNum(f.lastWithinMin) > 0)) return false;
+        const ts = recSeenAt(p);
+        return ts == null || !Number.isFinite(nowSec) || (nowSec - ts) / 60 > f.lastWithinMin;
     }
 
     const recMark = (marks, id) => (!marks ? null : marks instanceof Map ? marks.get(id) : marks[id]) || null;
@@ -2669,7 +2706,7 @@
      * @param p Player
      * @param f {workMin, workMax (0 or missing = open), levelMin, levelMax, kinds:{none, city, company} (default all),
      *   starsMax (company jobs only), dirMin (director away at least this many days), daysMin (days in the job),
-     *   lastWithinMin (minutes), hideContactedDays (0 = never hide)}
+     *   lastWithinMin (minutes), onlineOnly (Online or Idle now; overrides lastWithinMin), hideContactedDays (0 = never hide)}
      * @param marks {[playerId]: Mark} or Map; Contacted and Rejected are hidden for hideContactedDays after `at`
      * @param ctx {nowSec, companyId} our own company's people are left out
      *   A player with an unknown work-stats total fails a work-stats range; an unknown director-away or last action fails its filter.
@@ -2693,10 +2730,7 @@
                 if (away == null || away < f.dirMin) return 'director';
             }
         }
-        if (recNum(f.lastWithinMin) > 0) {
-            const ts = p.lastAction && p.lastAction.timestamp;
-            if (ts == null || !Number.isFinite(now) || (now - ts) / 60 > f.lastWithinMin) return 'last';
-        }
+        if (recLastOut(p, f, now)) return 'last';
         if (recNum(f.hideContactedDays) > 0) {
             const m = recMark(marks, p.id);
             if (m && (m.status === 'Contacted' || m.status === 'Rejected')
@@ -2740,7 +2774,7 @@
     }
 
     /**
-     * Sort rows (new array). Keys: 'close' the closest to the need from above first, then those below it nearest first;
+     * Sort rows (new array). Players online now come first whatever the key. Keys: 'close' the closest to the need from above first, then those below it nearest first;
      * 'move' most likely to move (ties: closest); 'act' most recent action; 'high' highest work stats. Unknowns last.
      */
     function recSort(rows, key, need = 0, ourStars = 0, nowSec) {
@@ -2762,7 +2796,8 @@
             act: (a, b) => last(b) - last(a),
             high: (a, b) => (ws(b) ?? -Infinity) - (ws(a) ?? -Infinity),
         };
-        const cmp = cmps[key] || cmps.close;
+        const by = cmps[key] || cmps.close;
+        const cmp = (a, b) => Number(recOnlineNow(b, nowSec)) - Number(recOnlineNow(a, nowSec)) || by(a, b);
         return (rows || []).map((p, i) => ({ p, i })).sort((a, b) => cmp(a.p, b.p) || a.i - b.i).map((x) => x.p);
     }
 
@@ -4513,23 +4548,26 @@
 
     const APP_SEARCH_PAGE = 25;
     const APP_SEARCH_MAX_PAGES = 24;
+    const APP_STALE_SEC = 86400;
+    const APP_PASS_GIVE_UP = 25; // a later pass whose first 25 players are all outside the window is dropped
 
     /** The calls the search makes; tests pass fakes. */
     const APP_SEARCH_API = { search: apiUserSearch, lookup: apiPlayerLookup, brief: apiCompanyBrief, companyType: apiCompanyType };
 
-    /** What Torn can filter for us from the screen's filters. */
+    /** What Torn can filter for us from the screen's filters: one `filters` string per search pass, in order. */
     function appServerFilters(f) {
-        return recSearchFilters({
+        return recSearchPasses({
             kinds: f.kinds,
             lastWithinMin: f.lastWithinMin,
+            onlineOnly: f.onlineOnly,
             levelMin: f.levelMin,
             levelMax: f.levelMax,
         });
     }
 
-    /** "~104 calls · ~4 min" before the search starts. */
-    function appSearchEstimate(best, callsPerMinute) {
-        const calls = Math.ceil(best / APP_SEARCH_PAGE) + best;
+    /** "~104 calls · ~4 min" before the search starts; `passes`: the Torn searches it runs (a page each at least). */
+    function appSearchEstimate(best, callsPerMinute, passes = 1) {
+        const calls = Math.ceil(best / APP_SEARCH_PAGE) + Math.max(0, passes - 1) + best;
         return { calls, minutes: Math.max(1, Math.ceil(calls / Math.max(1, callsPerMinute))) };
     }
 
@@ -4612,32 +4650,51 @@
 
         async function run() {
             logAdd(st, { kind: 'search-start', best, torn: appServerFilters(getF()), filters: getF() });
-            const rows = [];
+            const passes = appServerFilters(getF());
             const seen = new Set();
-            let cursor = null;
-            for (let page = 0; page < APP_SEARCH_MAX_PAGES && rows.length < best && !stopped; page += 1) {
-                prog.calls += 1;
-                const r = await api.search(client, { filters: appServerFilters(getF()), cursor, priority: 'normal' });
-                for (const row of r.rows) {
-                    if (rows.length >= best) break;
-                    if (!seen.has(row.id)) {
-                        seen.add(row.id);
-                        rows.push(row);
-                    }
-                }
-                prog.total = Math.min(best, r.total != null ? Math.max(rows.length, Math.min(r.total, best)) : rows.length);
-                onProgress(prog);
-                cursor = r.next;
-                if (!cursor) break;
-            }
-            prog.total = rows.length;
-            onProgress(prog);
+            const cursors = passes.map(() => undefined); // undefined: not asked yet; null: no more pages
+            const tried = passes.map(() => 0);
+            const hit = passes.map((_, i) => i === 0);
+            const dropped = (pass) => !hit[pass] && tried[pass] >= APP_PASS_GIVE_UP;
+            let pages = 0;
 
-            for (const row of rows) {
-                if (stopped) break;
+            // Up to `want` new rows from one pass, from where it stopped last.
+            async function fetchRows(pass, want) {
+                const got = [];
+                while (got.length < want && cursors[pass] !== null && pages < APP_SEARCH_MAX_PAGES && !stopped) {
+                    pages += 1;
+                    prog.calls += 1;
+                    const r = await api.search(client, { filters: passes[pass], cursor: cursors[pass] || null, priority: 'normal' });
+                    for (const row of r.rows) {
+                        if (got.length < want && !seen.has(row.id)) {
+                            seen.add(row.id);
+                            got.push({ row, pass });
+                        }
+                    }
+                    cursors[pass] = r.next || null;
+                }
+                prog.total += got.length;
+                onProgress(prog);
+                return got;
+            }
+
+            async function check({ row, pass }) {
+                if (dropped(pass)) {
+                    prog.total -= 1;
+                    onProgress(prog);
+                    return;
+                }
                 const now = nowSec();
                 let p = st.players[String(row.id)];
-                if (!appPlayerFresh(p, settings.recheckDays, now)) {
+                const rowOn = row.online === 'Online' || row.online === 'Idle';
+                if (p && row.online && (p.online !== row.online || rowOn)) {
+                    // The search row's status is fresh even when the rest of a remembered player is not.
+                    p = { ...p, online: row.online, onlineAt: rowOn ? now : p.onlineAt };
+                    appRememberPlayer(st, p);
+                }
+                // A remembered player is asked again only when Torn shows them on now but our last action is over a day old.
+                const lastTs = p && p.lastAction && p.lastAction.timestamp != null ? p.lastAction.timestamp : -Infinity;
+                if (!appPlayerFresh(p, settings.recheckDays, now) || (rowOn && now - lastTs > APP_STALE_SEC)) {
                     try {
                         prog.calls += 1;
                         p = await api.lookup(client, row.id, { typeNames: typeNames(), priority: 'low' });
@@ -4651,6 +4708,8 @@
                     }
                 }
                 if (p) {
+                    tried[pass] += 1;
+                    if (!recLastOut(p, getF(), nowSec())) hit[pass] = true;
                     prog.ids.push(p.id);
                     try {
                         await learnType(p);
@@ -4661,6 +4720,23 @@
                 }
                 prog.checked += 1;
                 onProgress(prog);
+            }
+
+            // Each pass may fill its share of what is left; the last one takes all of it.
+            let queue = [];
+            for (let pass = 0; pass < passes.length && queue.length < best && !stopped; pass += 1) {
+                const share = pass === passes.length - 1 ? best - queue.length : Math.ceil((best - queue.length) / (passes.length - pass));
+                queue = queue.concat(await fetchRows(pass, share));
+            }
+            // Room a dropped pass left is given back to the passes still finding people, earliest first.
+            while (queue.length && !stopped) {
+                for (const item of queue) {
+                    if (stopped) break;
+                    await check(item);
+                }
+                const room = best - prog.ids.length - prog.failed;
+                const pass = passes.findIndex((_, i) => !dropped(i) && cursors[i] !== null);
+                queue = room > 0 && pass >= 0 ? await fetchRows(pass, room) : [];
             }
         }
 
@@ -4699,7 +4775,7 @@
         return {
             auto: true, min: 0, max: 0, fmin: 0, fmax: 0, levelMin: 1, levelMax: 100,
             kinds: { none: true, city: true, company: true }, starsMax: settings.hideHigherStars ? stars : 10, dirMin: 0, daysMin: 0,
-            lastWithinMin: 2880, hide: true, sort: 'close', best: settings.bestDefault,
+            lastWithinMin: 1440, onlineOnly: false, hide: true, sort: 'close', best: settings.bestDefault,
         };
     }
 
@@ -4738,7 +4814,7 @@
         const work = pgWork(h);
         return {
             workMin: work.min, workMax: work.max, levelMin: f.levelMin, levelMax: f.levelMax,
-            kinds: f.kinds, starsMax: f.starsMax, dirMin: f.dirMin, daysMin: f.daysMin, lastWithinMin: f.lastWithinMin,
+            kinds: f.kinds, starsMax: f.starsMax, dirMin: f.dirMin, daysMin: f.daysMin, lastWithinMin: f.lastWithinMin, onlineOnly: !!f.onlineOnly,
             hideContactedDays: f.hide ? h.st.settings.hideContactedDays : 0,
         };
     }
@@ -4848,7 +4924,7 @@
         const match = pgMatch(h);
         const ourStars = st.company ? st.company.stars : 0;
         const starOpts = [...new Set([0, 1, 2, 3, 4, 5, 10, ourStars, f.starsMax])].sort((a, b) => a - b);
-        const est = appSearchEstimate(f.best, st.settings.callsPerMinute);
+        const est = appSearchEstimate(f.best, st.settings.callsPerMinute, appServerFilters(pgFilter(h)).length);
         const running = !!ui.search && ui.search.prog.state === 'running';
         const work = pgWork(h);
         const wMin = work.min;
@@ -4867,7 +4943,7 @@
        <div class="rw"><span>Director away ≥ days</span>${num('dirMin', f.dirMin, 'min="0" max="30"')}</div>
        <div class="rw"><span>Days there ≥</span>${num('daysMin', f.daysMin, 'min="0"')}</div></div></div>
      <div class="fs"><label>Level</label><div class="range">${num('levelMin', f.levelMin, 'min="1" aria-label="Level from"')}<span>–</span>${num('levelMax', f.levelMax, 'min="1" aria-label="Level to"')}</div></div>
-     <div class="fs"><label>Last action within</label><select data-f="lastWithinMin" aria-label="Last action within">${[[60, '1 hour'], [1440, '24 hours'], [2880, '48 hours'], [10080, '7 days']].map(([val, l]) => `<option value="${val}" ${f.lastWithinMin === val ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+     <div class="fs"><label>Last action</label><select data-f="lastWithinMin" aria-label="Last action">${[['online', 'Online now'], [60, 'Within 1 hour'], [1440, 'Within 24 hours'], [2880, 'Within 48 hours'], [10080, 'Within 7 days']].map(([val, l]) => `<option value="${val}" ${(val === 'online' ? !!f.onlineOnly : !f.onlineOnly && f.lastWithinMin === val) ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
      <div class="fs"><label>Players to check</label><div class="seg" role="group" aria-label="Players to check" style="display:flex">${PG_BEST.map((val) => `<button data-act="best" data-v="${val}" aria-pressed="${f.best === val}" style="flex:1">${val}</button>`).join('')}</div>
       <label class="checks" style="margin-top:10px"><label><input type="checkbox" data-f="hide" ${f.hide ? 'checked' : ''}> Hide contacted and rejected</label></label></div>
      <div class="ffoot">${running ? '<button class="btn sm pri" data-act="stopsearch">Stop</button>' : '<button class="btn sm pri" data-act="search">Search Torn</button>'}<button class="btn sm" data-act="resetf" style="margin-left:auto">Reset</button><span class="est2">~${est.calls} calls · ${est.minutes} min</span></div>`;
@@ -5697,7 +5773,10 @@
         if (key === 'min' || key === 'max') hubFreezeWork(hub);
         if (key.startsWith('kinds.')) f.kinds = { ...f.kinds, [key.slice(6)]: el.checked };
         else if (key === 'hide') f.hide = el.checked;
-        else if (key === 'starsMax' || key === 'lastWithinMin') f[key] = Number(el.value);
+        else if (key === 'lastWithinMin') {
+            f.onlineOnly = el.value === 'online';
+            if (!f.onlineOnly) f.lastWithinMin = Number(el.value);
+        } else if (key === 'starsMax') f[key] = Number(el.value);
         else f[key] = Math.max(0, Number(el.value) || 0);
     }
 
